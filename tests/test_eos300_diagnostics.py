@@ -63,3 +63,30 @@ async def test_simulation_writes_private_jsonl_and_counts_duplicate(tmp_path):
     assert state.duplicates == 1
     assert rows[2]["duplicate_index"] == 2
     assert stat.S_IMODE(output.stat().st_mode) == 0o600
+
+
+async def test_websocket_ids_match_topology_alias_and_ack_is_classified(tmp_path):
+    """WebSocket records must use one redaction pass and identify re-subscribe acks."""
+    output = tmp_path / "diagnostics.jsonl"
+    redactor = DIAGNOSTICS.Redactor(salt=b"fixed-test-salt")
+    recorder = DIAGNOSTICS.JsonlRecorder(output, redactor)
+    state = DIAGNOSTICS.ProbeState(recorder, redactor)
+
+    recorder.record("topology", module={"id": "shared-module-id"})
+    await state.on_message(
+        {
+            "push_type": "embedded_json",
+            "extra_params": {
+                "home": {"modules": [{"id": "shared-module-id", "sensor_status": "triggered"}]},
+            },
+        },
+    )
+    await state.on_message({"status": "ok"})
+    recorder.close()
+
+    rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    topology_alias = rows[0]["module"]["id"]
+    websocket_alias = rows[1]["message"]["extra_params"]["home"]["modules"][0]["id"]
+    assert websocket_alias == topology_alias
+    assert rows[1]["event_type"] == "module_status"
+    assert rows[2]["push_type"] == "subscription_ack"

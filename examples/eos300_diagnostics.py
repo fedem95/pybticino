@@ -164,9 +164,17 @@ class ProbeState:
         if duplicate_index > 1:
             self.duplicates += 1
 
-        push_type = str(message.get("push_type", "<missing>"))
+        raw_push_type = message.get("push_type")
+        if raw_push_type:
+            push_type = str(raw_push_type)
+        elif message.get("status") == "ok":
+            push_type = "subscription_ack"
+        else:
+            push_type = "<missing>"
         extra_params = message.get("extra_params")
         event_type = extra_params.get("event_type") if isinstance(extra_params, dict) else None
+        if push_type == "embedded_json" and event_type is None:
+            event_type = "module_status"
         self.push_types[push_type] += 1
         self.messages += 1
         self.recorder.record(
@@ -176,7 +184,10 @@ class ProbeState:
             event_type=event_type,
             fingerprint=fingerprint,
             duplicate_index=duplicate_index,
-            message=sanitized,
+            # JsonlRecorder performs the single redaction pass. Passing the
+            # already-redacted copy here would hash identifiers twice and make
+            # them impossible to correlate with topology/status records.
+            message=message,
         )
 
     def summary(self) -> dict[str, Any]:
