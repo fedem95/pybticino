@@ -35,12 +35,24 @@ _SECRET_KEYS = {
     "authorization",
     "client_secret",
     "credential",
+    "invitation_code",
     "password",
     "refresh_token",
     "secret",
     "token",
 }
 _NAME_KEYS = {"email", "home_name", "name", "username", "user"}
+_LOCATION_KEYS = {
+    "address",
+    "altitude",
+    "city",
+    "coordinates",
+    "latitude",
+    "longitude",
+    "postal_code",
+    "postcode",
+}
+_IDENTIFIER_LIST_KEYS = {"module_ids", "modules_bridged"}
 _IDENTIFIER_KEYS = {
     "bridge",
     "bridge_id",
@@ -91,8 +103,21 @@ class Redactor:
             return "<redacted-url>"
         if normalized_key in _NAME_KEYS or normalized_key.endswith("_name"):
             return "<redacted-name>"
+        if normalized_key in _LOCATION_KEYS:
+            return "<redacted-location>"
         if normalized_key in _IDENTIFIER_KEYS or normalized_key.endswith("_id"):
             return self.alias(normalized_key or "id", value)
+        if normalized_key in _IDENTIFIER_LIST_KEYS and isinstance(value, (list, tuple)):
+            return [self.alias("id", item) for item in value]
+
+        # Room payloads use ``modules`` for a list of raw module identifiers,
+        # while home/status payloads use the same key for full module objects.
+        # Preserve the objects but pseudonymize scalar identifier collections.
+        if normalized_key == "modules" and isinstance(value, (list, tuple)):
+            if all(not isinstance(item, (dict, list, tuple)) for item in value):
+                return [self.alias("id", item) for item in value]
+        if normalized_key == "message" and isinstance(value, str):
+            return "<redacted-message>"
 
         if isinstance(value, dict):
             return {str(item_key): self.sanitize(item_value, str(item_key)) for item_key, item_value in value.items()}

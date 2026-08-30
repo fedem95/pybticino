@@ -24,6 +24,17 @@ def test_redactor_removes_secrets_and_keeps_aliases_stable():
             "snapshot_url": "https://example.invalid/private",
             "message": "Device 00:03:50:aa:bb:cc at 192.168.1.10",
         },
+        "city": "Privateville",
+        "coordinates": [45.12345, 8.54321],
+        "invitation_code": ["invite-me-secretly"],
+        "rooms": [
+            {
+                "module_ids": ["module-secret-id"],
+                "modules": ["module-secret-id"],
+            },
+        ],
+        "modules": [{"id": "module-secret-id", "type": "BNDL"}],
+        "modules_bridged": ["module-secret-id"],
     }
 
     sanitized = redactor.sanitize(payload)
@@ -36,9 +47,18 @@ def test_redactor_removes_secrets_and_keeps_aliases_stable():
         "https://example.invalid",
         "00:03:50:aa:bb:cc",
         "192.168.1.10",
+        "Privateville",
+        "45.12345",
+        "8.54321",
+        "invite-me-secretly",
+        "module-secret-id",
     ):
         assert secret not in encoded
     assert sanitized["home_id"] == sanitized["nested"]["home_id"]
+    module_alias = sanitized["modules"][0]["id"]
+    assert sanitized["rooms"][0]["module_ids"] == [module_alias]
+    assert sanitized["rooms"][0]["modules"] == [module_alias]
+    assert sanitized["modules_bridged"] == [module_alias]
 
 
 async def test_simulation_writes_private_jsonl_and_counts_duplicate(tmp_path):
