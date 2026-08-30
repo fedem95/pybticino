@@ -110,3 +110,38 @@ async def test_websocket_ids_match_topology_alias_and_ack_is_classified(tmp_path
     assert websocket_alias == topology_alias
     assert rows[1]["event_type"] == "module_status"
     assert rows[2]["push_type"] == "subscription_ack"
+
+
+async def test_sequence_id_detects_retransmission_with_changed_volatile_fields(tmp_path):
+    """A repeated sequence is a duplicate even when timestamps and uptime change."""
+    output = tmp_path / "diagnostics.jsonl"
+    redactor = DIAGNOSTICS.Redactor(salt=b"fixed-test-salt")
+    recorder = DIAGNOSTICS.JsonlRecorder(output, redactor)
+    state = DIAGNOSTICS.ProbeState(recorder, redactor)
+
+    first = {
+        "push_type": "embedded_json",
+        "ts_generated": 100,
+        "extra_params": {
+            "sequence_id": "shared-sequence",
+            "home": {"modules": [{"id": "module-id", "sensor_status": "idle", "uptime": 10}]},
+        },
+    }
+    second = {
+        **first,
+        "ts_generated": 101,
+        "extra_params": {
+            **first["extra_params"],
+            "home": {"modules": [{"id": "module-id", "sensor_status": "idle", "uptime": 11}]},
+        },
+    }
+
+    await state.on_message(first)
+    await state.on_message(second)
+    recorder.close()
+
+    rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    assert state.duplicates == 1
+    assert rows[0]["fingerprint_source"] == "sequence_id"
+    assert rows[0]["fingerprint"] == rows[1]["fingerprint"]
+    assert rows[1]["duplicate_index"] == 2

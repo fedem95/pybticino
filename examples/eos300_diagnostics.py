@@ -182,7 +182,20 @@ class ProbeState:
     async def on_message(self, message: dict[str, Any]) -> None:
         """Record one sanitized WebSocket push and duplicate metadata."""
         sanitized = self.redactor.sanitize(message)
-        canonical = json.dumps(sanitized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        sanitized_extra_params = sanitized.get("extra_params")
+        sequence_id = (
+            sanitized_extra_params.get("sequence_id") if isinstance(sanitized_extra_params, dict) else None
+        )
+        if sequence_id:
+            fingerprint_payload = {
+                "push_type": sanitized.get("push_type"),
+                "sequence_id": sequence_id,
+            }
+            fingerprint_source = "sequence_id"
+        else:
+            fingerprint_payload = sanitized
+            fingerprint_source = "full_message"
+        canonical = json.dumps(fingerprint_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         fingerprint = hashlib.sha256(canonical.encode()).hexdigest()[:16]
         self.fingerprints[fingerprint] += 1
         duplicate_index = self.fingerprints[fingerprint]
@@ -208,6 +221,7 @@ class ProbeState:
             push_type=push_type,
             event_type=event_type,
             fingerprint=fingerprint,
+            fingerprint_source=fingerprint_source,
             duplicate_index=duplicate_index,
             # JsonlRecorder performs the single redaction pass. Passing the
             # already-redacted copy here would hash identifiers twice and make
