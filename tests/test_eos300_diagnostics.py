@@ -4,6 +4,7 @@ import importlib.util
 import json
 from pathlib import Path
 import stat
+from types import SimpleNamespace
 
 SCRIPT_PATH = Path(__file__).parents[1] / "examples" / "eos300_diagnostics.py"
 SPEC = importlib.util.spec_from_file_location("eos300_diagnostics", SCRIPT_PATH)
@@ -145,3 +146,32 @@ async def test_sequence_id_detects_retransmission_with_changed_volatile_fields(t
     assert rows[0]["fingerprint_source"] == "sequence_id"
     assert rows[0]["fingerprint"] == rows[1]["fingerprint"]
     assert rows[1]["duplicate_index"] == 2
+
+
+async def test_forced_drop_aborts_only_probe_transport_and_records_success(tmp_path):
+    """The live reconnect test should abort its socket and expose clear counters."""
+    output = tmp_path / "diagnostics.jsonl"
+    redactor = DIAGNOSTICS.Redactor(salt=b"fixed-test-salt")
+    recorder = DIAGNOSTICS.JsonlRecorder(output, redactor)
+    state = DIAGNOSTICS.ProbeState(recorder, redactor)
+
+    transport = SimpleNamespace(aborted=False)
+
+    def abort():
+        transport.aborted = True
+
+    transport.abort = abort
+    client = object.__new__(DIAGNOSTICS.ObservedWebsocketClient)
+    client._is_running = True
+    client._websocket = SimpleNamespace(transport=transport)
+
+    await DIAGNOSTICS._force_drop_after(client, state, delay=0)
+    recorder.close()
+
+    rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    assert transport.aborted is True
+    assert state.forced_drop_attempts == 1
+    assert state.forced_drop_successes == 1
+    assert state.forced_drop_failures == 0
+    assert rows[0]["record_type"] == "websocket_forced_drop"
+    assert rows[0]["result"] == "success"

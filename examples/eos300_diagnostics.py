@@ -178,6 +178,9 @@ class ProbeState:
         self.connect_failures = 0
         self.resubscribe_successes = 0
         self.resubscribe_failures = 0
+        self.forced_drop_attempts = 0
+        self.forced_drop_successes = 0
+        self.forced_drop_failures = 0
 
     async def on_message(self, message: dict[str, Any]) -> None:
         """Record one sanitized WebSocket push and duplicate metadata."""
@@ -240,6 +243,9 @@ class ProbeState:
             "connect_failures": self.connect_failures,
             "resubscribe_successes": self.resubscribe_successes,
             "resubscribe_failures": self.resubscribe_failures,
+            "forced_drop_attempts": self.forced_drop_attempts,
+            "forced_drop_successes": self.forced_drop_successes,
+            "forced_drop_failures": self.forced_drop_failures,
         }
 
 
@@ -287,6 +293,15 @@ class ObservedWebsocketClient(WebsocketClient):
         else:
             self._probe_state.recorder.record("websocket_listener_stopped", reason="clean")
 
+    def abort_transport_for_test(self) -> None:
+        """Abort only this client's socket to simulate a connection drop."""
+        if not self._is_running or self._websocket is None:
+            raise RuntimeError("No active WebSocket transport to abort.")
+        transport = getattr(self._websocket, "transport", None)
+        if transport is None or not callable(getattr(transport, "abort", None)):
+            raise RuntimeError("The active WebSocket does not expose an abortable transport.")
+        transport.abort()
+
 
 def _default_output_path() -> Path:
     timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -325,6 +340,25 @@ async def _resubscribe_loop(client: WebsocketClient, state: ProbeState, interval
             state.recorder.record("websocket_resubscribe", result="success")
 
 
+async def _force_drop_after(client: ObservedWebsocketClient, state: ProbeState, delay: float) -> None:
+    """Abort the probe's socket after a delay so ``run_forever`` must reconnect."""
+    await asyncio.sleep(delay)
+    state.forced_drop_attempts += 1
+    try:
+        client.abort_transport_for_test()
+    except Exception as error:
+        state.forced_drop_failures += 1
+        state.recorder.record(
+            "websocket_forced_drop",
+            result="failure",
+            error_type=type(error).__name__,
+            error=str(error),
+        )
+    else:
+        state.forced_drop_successes += 1
+        state.recorder.record("websocket_forced_drop", result="success", method="transport_abort")
+
+
 async def _stop_client(client: WebsocketClient, run_task: asyncio.Task[Any]) -> None:
     await client.disconnect()
     try:
@@ -346,7 +380,13 @@ async def run_live(args: argparse.Namespace, recorder: JsonlRecorder, state: Pro
     client: ObservedWebsocketClient | None = None
     run_task: asyncio.Task[Any] | None = None
     resubscribe_task: asyncio.Task[Any] | None = None
+    forced_drop_task: asyncio.Task[Any] | None = None
     try:
+        if args.force_drop_after < 0:
+            raise ValueError("--force-drop-after cannot be negative.")
+        if args.force_drop_after and args.force_drop_after >= args.duration:
+            raise ValueError("--force-drop-after must be less than --duration.")
+
         recorder.record("api_request", operation="topology")
         await account.async_update_topology()
         home_id, home = _select_home(account, args.home_id or os.getenv("BTICINOHOMEID"))
@@ -372,9 +412,17 @@ async def run_live(args: argparse.Namespace, recorder: JsonlRecorder, state: Pro
             resubscribe_task = asyncio.create_task(
                 _resubscribe_loop(client, state, args.resubscribe_interval),
             )
+        if args.force_drop_after > 0:
+            forced_drop_task = asyncio.create_task(
+                _force_drop_after(client, state, args.force_drop_after),
+            )
         recorder.record("observation_started", duration_seconds=args.duration)
         await asyncio.sleep(args.duration)
     finally:
+        if forced_drop_task:
+            forced_drop_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await forced_drop_task
         if resubscribe_task:
             resubscribe_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -414,6 +462,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=300,
         help="Seconds between token re-subscriptions; 0 disables it (default: 300).",
+    )
+    parser.add_argument(
+        "--force-drop-after",
+        type=float,
+        default=0,
+        help="Abort only the probe WebSocket after N seconds to test automatic reconnection; 0 disables it.",
     )
     parser.add_argument("--simulate", action="store_true", help="Run an offline redaction/duplicate simulation.")
     return parser
