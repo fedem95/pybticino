@@ -62,6 +62,57 @@ def test_redactor_removes_secrets_and_keeps_aliases_stable():
     assert sanitized["modules_bridged"] == [module_alias]
 
 
+def test_bridge_busy_samples_distinguish_false_missing_and_ignore_other_modules(tmp_path):
+    """Busy diagnostics must preserve false versus absent and only inspect bridges."""
+    output = tmp_path / "diagnostics.jsonl"
+    redactor = DIAGNOSTICS.Redactor(salt=b"fixed-test-salt")
+    recorder = DIAGNOSTICS.JsonlRecorder(output, redactor)
+    state = DIAGNOSTICS.ProbeState(recorder, redactor)
+    status_false = {
+        "body": {
+            "home": {
+                "modules": [
+                    {"id": "bridge-id", "type": "BNCX", "busy": False, "reachable": True},
+                    {"id": "lock-id", "type": "BNDL", "busy": True},
+                ]
+            }
+        }
+    }
+    status_missing = {"body": {"home": {"modules": [{"id": "bridge-id", "type": "BNCX", "reachable": True}]}}}
+
+    DIAGNOSTICS._record_bridge_busy_samples(status_false, state, 1)
+    DIAGNOSTICS._record_bridge_busy_samples(status_missing, state, 2)
+    recorder.close()
+
+    rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    assert len(rows) == 2
+    assert rows[0]["bridge_type"] == "BNCX"
+    assert rows[0]["busy_field_present"] is True
+    assert rows[0]["busy"] is False
+    assert rows[0]["changed"] is False
+    assert rows[1]["busy_field_present"] is False
+    assert rows[1]["busy"] is None
+    assert rows[1]["changed"] is True
+    assert state.busy_samples == 2
+    assert state.busy_transitions == 1
+
+
+def test_bridge_busy_sample_records_missing_bridge(tmp_path):
+    """A malformed or bridge-free response must be visible rather than ambiguous."""
+    output = tmp_path / "diagnostics.jsonl"
+    redactor = DIAGNOSTICS.Redactor(salt=b"fixed-test-salt")
+    recorder = DIAGNOSTICS.JsonlRecorder(output, redactor)
+    state = DIAGNOSTICS.ProbeState(recorder, redactor)
+
+    DIAGNOSTICS._record_bridge_busy_samples({"body": {"home": {"modules": []}}}, state, 1)
+    recorder.close()
+
+    row = json.loads(output.read_text(encoding="utf-8"))
+    assert row["record_type"] == "bridge_busy_sample"
+    assert row["bridge_found"] is False
+    assert state.busy_bridge_misses == 1
+
+
 async def test_simulation_writes_private_jsonl_and_counts_duplicate(tmp_path):
     """The offline mode should produce shareable, private diagnostic output."""
     output = tmp_path / "diagnostics.jsonl"

@@ -138,6 +138,25 @@ Key guides from reverse engineering:
 - **[WebSocket Events](https://k-the-hidden-hero.github.io/pybticino/websocket-events/)** — all push notification types and their JSON structures
 - **[Reverse Engineering Notes](https://k-the-hidden-hero.github.io/pybticino/reverse-engineering-notes/)** — findings from decompiling the official BTicino/Netatmo app
 
+### EOS 300 bridge-busy diagnostic
+
+The lab branch includes a read-only probe that can sample the `busy` field of
+`BNC1` and `BNCX` bridges while it records the corresponding WebSocket events.
+It does not send device commands or start a WebRTC session.
+
+```bash
+.venv/bin/python examples/eos300_diagnostics.py \
+  --duration 90 \
+  --busy-poll-interval 1 \
+  --resubscribe-interval 0
+```
+
+Run it after exporting `BTICINOUSER` and `BTICINOPASSWORD`; do not put the real
+password directly in the command. Ring, answer, and end one intercom call
+during the 90-second observation. The
+generated private JSONL distinguishes `busy: false` from a missing `busy` field
+and reports `busy_transitions` in the final summary.
+
 ### Examples
 
 Working example scripts in [`examples/`](examples/):

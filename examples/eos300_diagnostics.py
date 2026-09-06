@@ -113,9 +113,12 @@ class Redactor:
         # Room payloads use ``modules`` for a list of raw module identifiers,
         # while home/status payloads use the same key for full module objects.
         # Preserve the objects but pseudonymize scalar identifier collections.
-        if normalized_key == "modules" and isinstance(value, (list, tuple)):
-            if all(not isinstance(item, (dict, list, tuple)) for item in value):
-                return [self.alias("id", item) for item in value]
+        if (
+            normalized_key == "modules"
+            and isinstance(value, (list, tuple))
+            and all(not isinstance(item, (dict, list, tuple)) for item in value)
+        ):
+            return [self.alias("id", item) for item in value]
         if normalized_key == "message" and isinstance(value, str):
             return "<redacted-message>"
 
@@ -181,14 +184,18 @@ class ProbeState:
         self.forced_drop_attempts = 0
         self.forced_drop_successes = 0
         self.forced_drop_failures = 0
+        self.busy_poll_requests = 0
+        self.busy_poll_failures = 0
+        self.busy_samples = 0
+        self.busy_transitions = 0
+        self.busy_bridge_misses = 0
+        self._last_busy_state: dict[str, tuple[bool, Any]] = {}
 
     async def on_message(self, message: dict[str, Any]) -> None:
         """Record one sanitized WebSocket push and duplicate metadata."""
         sanitized = self.redactor.sanitize(message)
         sanitized_extra_params = sanitized.get("extra_params")
-        sequence_id = (
-            sanitized_extra_params.get("sequence_id") if isinstance(sanitized_extra_params, dict) else None
-        )
+        sequence_id = sanitized_extra_params.get("sequence_id") if isinstance(sanitized_extra_params, dict) else None
         if sequence_id:
             fingerprint_payload = {
                 "push_type": sanitized.get("push_type"),
@@ -246,6 +253,11 @@ class ProbeState:
             "forced_drop_attempts": self.forced_drop_attempts,
             "forced_drop_successes": self.forced_drop_successes,
             "forced_drop_failures": self.forced_drop_failures,
+            "busy_poll_requests": self.busy_poll_requests,
+            "busy_poll_failures": self.busy_poll_failures,
+            "busy_samples": self.busy_samples,
+            "busy_transitions": self.busy_transitions,
+            "busy_bridge_misses": self.busy_bridge_misses,
         }
 
 
@@ -320,6 +332,100 @@ def _select_home(account: AsyncAccount, requested_home_id: str | None) -> tuple[
     return home_id, account.homes[home_id]
 
 
+def _extract_bridge_busy_samples(status: Any) -> list[dict[str, Any]]:
+    """Extract BNC1/BNCX busy values while preserving missing-vs-false."""
+    if not isinstance(status, dict):
+        return []
+    body = status.get("body")
+    if not isinstance(body, dict):
+        return []
+    home = body.get("home")
+    if not isinstance(home, dict):
+        return []
+    modules = home.get("modules")
+    if not isinstance(modules, list):
+        return []
+
+    samples: list[dict[str, Any]] = []
+    for module in modules:
+        if not isinstance(module, dict) or module.get("type") not in {"BNC1", "BNCX"}:
+            continue
+        field_present = "busy" in module
+        samples.append(
+            {
+                "bridge_id": module.get("id"),
+                "bridge_type": module.get("type"),
+                "busy_field_present": field_present,
+                "busy": module.get("busy") if field_present else None,
+                "reachable": module.get("reachable"),
+                "websocket_connected": module.get("websocket_connected"),
+            }
+        )
+    return samples
+
+
+def _record_bridge_busy_samples(status: Any, state: ProbeState, sample_number: int) -> None:
+    """Record compact bridge samples and count actual representation changes."""
+    samples = _extract_bridge_busy_samples(status)
+    if not samples:
+        state.busy_bridge_misses += 1
+        state.recorder.record(
+            "bridge_busy_sample",
+            sample_number=sample_number,
+            bridge_found=False,
+        )
+        return
+
+    for sample in samples:
+        state.busy_samples += 1
+        bridge_key = str(sample["bridge_id"])
+        current = (sample["busy_field_present"], sample["busy"])
+        previous = state._last_busy_state.get(bridge_key)
+        changed = previous is not None and previous != current
+        if changed:
+            state.busy_transitions += 1
+        state._last_busy_state[bridge_key] = current
+        state.recorder.record(
+            "bridge_busy_sample",
+            sample_number=sample_number,
+            bridge_found=True,
+            changed=changed,
+            **sample,
+        )
+
+
+async def _busy_poll_loop(
+    account: AsyncAccount,
+    home_id: str,
+    state: ProbeState,
+    interval: float,
+) -> None:
+    """Poll the read-only home status endpoint at a fixed start-to-start rate."""
+    loop = asyncio.get_running_loop()
+    sample_number = 0
+    while True:
+        started = loop.time()
+        sample_number += 1
+        state.busy_poll_requests += 1
+        try:
+            status = await account.async_get_home_status(home_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            state.busy_poll_failures += 1
+            state.recorder.record(
+                "bridge_busy_poll_failure",
+                sample_number=sample_number,
+                error_type=type(error).__name__,
+                error=str(error),
+            )
+        else:
+            _record_bridge_busy_samples(status, state, sample_number)
+
+        elapsed = loop.time() - started
+        await asyncio.sleep(max(0, interval - elapsed))
+
+
 async def _resubscribe_loop(client: WebsocketClient, state: ProbeState, interval: float) -> None:
     while True:
         await asyncio.sleep(interval)
@@ -381,11 +487,16 @@ async def run_live(args: argparse.Namespace, recorder: JsonlRecorder, state: Pro
     run_task: asyncio.Task[Any] | None = None
     resubscribe_task: asyncio.Task[Any] | None = None
     forced_drop_task: asyncio.Task[Any] | None = None
+    busy_poll_task: asyncio.Task[Any] | None = None
     try:
         if args.force_drop_after < 0:
             raise ValueError("--force-drop-after cannot be negative.")
         if args.force_drop_after and args.force_drop_after >= args.duration:
             raise ValueError("--force-drop-after must be less than --duration.")
+        if args.busy_poll_interval < 0:
+            raise ValueError("--busy-poll-interval cannot be negative.")
+        if 0 < args.busy_poll_interval < 0.5:
+            raise ValueError("--busy-poll-interval must be at least 0.5 seconds when enabled.")
 
         recorder.record("api_request", operation="topology")
         await account.async_update_topology()
@@ -416,9 +527,25 @@ async def run_live(args: argparse.Namespace, recorder: JsonlRecorder, state: Pro
             forced_drop_task = asyncio.create_task(
                 _force_drop_after(client, state, args.force_drop_after),
             )
-        recorder.record("observation_started", duration_seconds=args.duration)
+        if args.busy_poll_interval > 0:
+            busy_poll_task = asyncio.create_task(
+                _busy_poll_loop(account, home_id, state, args.busy_poll_interval),
+            )
+            print(
+                f"Bridge busy polling active every {args.busy_poll_interval:g}s. "
+                "Ring, answer, and end one intercom call while the probe is running."
+            )
+        recorder.record(
+            "observation_started",
+            duration_seconds=args.duration,
+            busy_poll_interval=args.busy_poll_interval,
+        )
         await asyncio.sleep(args.duration)
     finally:
+        if busy_poll_task:
+            busy_poll_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await busy_poll_task
         if forced_drop_task:
             forced_drop_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -468,6 +595,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0,
         help="Abort only the probe WebSocket after N seconds to test automatic reconnection; 0 disables it.",
+    )
+    parser.add_argument(
+        "--busy-poll-interval",
+        type=float,
+        default=0,
+        help="Poll read-only bridge busy status every N seconds; 0 disables it (minimum: 0.5).",
     )
     parser.add_argument("--simulate", action="store_true", help="Run an offline redaction/duplicate simulation.")
     return parser
