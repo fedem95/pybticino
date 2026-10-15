@@ -185,7 +185,9 @@ class AsyncAccount:
 
                 if response.status >= 400:
                     error_text = await response.text()
-                    LOG.error(
+                    # Raised to the caller, which decides how loud to be: a
+                    # 5xx from the cloud is routine and the caller retries.
+                    LOG.debug(
                         "API Error Response (%s): %s",
                         response.status,
                         error_text,
@@ -198,6 +200,10 @@ class AsyncAccount:
                         )
                     except (aiohttp.ContentTypeError, ValueError):  # fmt: skip
                         error_message = error_text
+                    if isinstance(error_message, str) and error_message.lstrip().startswith("<"):
+                        # Gateway errors come back as an nginx HTML page; the
+                        # reason phrase says the same thing in one line.
+                        error_message = response.reason or f"HTTP {response.status}"
                     raise ApiError(response.status, error_message)
 
                 # Handle empty response body for certain status codes if necessary
@@ -207,6 +213,10 @@ class AsyncAccount:
                 # Assuming JSON response for successful calls
                 return await response.json()
 
+        except ApiError:
+            # Raised above for an error status; keep its status code instead of
+            # letting the catch-all below rewrap it as "API Error 0".
+            raise
         except aiohttp.ClientResponseError as http_err:
             # This might be redundant if ApiError is raised above, but acts as a fallback
             LOG.exception("HTTP error during API request")
@@ -214,10 +224,10 @@ class AsyncAccount:
                 raise ApiError(http_err.status, str(http_err)) from http_err
             raise  # Re-raise the original ApiError
         except TimeoutError:
-            LOG.exception("Request timed out: POST %s", url)
+            LOG.debug("Request timed out: POST %s", url)
             raise ApiError(408, "Request timed out") from None
         except aiohttp.ClientError as req_err:
-            LOG.exception("Request error during API request")
+            LOG.debug("Request error during API request: %s", req_err)
             raise ApiError(0, f"Request error: {req_err}") from req_err
         except Exception as e:
             LOG.exception("Unexpected error during API request")

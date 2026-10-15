@@ -19,6 +19,18 @@ from .exceptions import AuthError, PyBticinoException
 _LOGGER = logging.getLogger(__name__)
 
 
+def _is_expected_connect_error(err: Exception) -> bool:
+    """Return whether a connect failure is routine network trouble.
+
+    Dropped connections, refused handshakes (the push server answers 503 while
+    it is overloaded) and timeouts happen several times a day and are retried by
+    the caller. Authentication failures and anything unexpected are not.
+    """
+    if isinstance(err, AuthError):
+        return False
+    return isinstance(err, OSError | websockets.exceptions.WebSocketException | PyBticinoException)
+
+
 class WebsocketClient:
     """Handles the WebSocket connection for receiving real-time push notifications.
 
@@ -146,7 +158,7 @@ class WebsocketClient:
             _LOGGER.warning("WebSocket connection closed during subscription.")
             raise  # Re-raise to trigger reconnection logic
         except TimeoutError:
-            _LOGGER.exception("Timeout waiting for WebSocket subscription response.")
+            _LOGGER.debug("Timeout waiting for WebSocket subscription response.")
             err_msg = "Timeout waiting for WebSocket subscription response."
             raise PyBticinoException(err_msg) from None
         except Exception as e:  # Added 'as e' back
@@ -340,9 +352,14 @@ class WebsocketClient:
                 )
 
             except Exception as e:
-                _LOGGER.exception(
-                    "WebsocketClient.connect: Failed during connection or subscription process",
-                )
+                if _is_expected_connect_error(e):
+                    # Re-raised below; the caller owns the reconnect and the
+                    # warning, so a traceback here only duplicates it.
+                    _LOGGER.debug("WebsocketClient.connect: connection or subscription failed: %s", e)
+                else:
+                    _LOGGER.exception(
+                        "WebsocketClient.connect: Failed during connection or subscription process",
+                    )
                 self._is_running = False  # Reset running state on failure
                 if (
                     self._websocket and self._websocket.state != State.CLOSED  # Use state check

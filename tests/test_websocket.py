@@ -5,6 +5,7 @@ import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import websockets
 
 from pybticino import AuthHandler, WebsocketClient
 from pybticino.exceptions import PyBticinoException
@@ -233,3 +234,45 @@ async def test_listener_handles_invalid_json():
     assert received[0] == {"valid": True}
 
     await client.disconnect()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        OSError("Connection refused"),
+        TimeoutError("timed out during opening handshake"),
+        websockets.exceptions.InvalidStatus(MagicMock(status_code=503)),
+    ],
+)
+async def test_routine_connect_failure_is_not_logged_as_error(failure, caplog):
+    """Network trouble is re-raised for the caller to retry, without a traceback."""
+    handler = AuthHandler(MOCK_USERNAME, MOCK_PASSWORD)
+    handler._access_token = MOCK_ACCESS_TOKEN
+    handler._token_expires_at = 9999999999.0
+    client = WebsocketClient(handler, AsyncMock())
+
+    with (
+        patch("pybticino.websocket.websockets.connect", new_callable=AsyncMock, side_effect=failure),
+        pytest.raises(PyBticinoException, match="connection/subscription failed"),
+    ):
+        await client.connect()
+
+    assert not [record for record in caplog.records if record.levelname == "ERROR"]
+
+
+async def test_unexpected_connect_failure_is_still_logged(caplog):
+    """Anything that isn't routine network trouble keeps its traceback."""
+    handler = AuthHandler(MOCK_USERNAME, MOCK_PASSWORD)
+    handler._access_token = MOCK_ACCESS_TOKEN
+    handler._token_expires_at = 9999999999.0
+    client = WebsocketClient(handler, AsyncMock())
+
+    with (
+        patch("pybticino.websocket.websockets.connect", new_callable=AsyncMock, side_effect=ValueError("boom")),
+        pytest.raises(PyBticinoException),
+    ):
+        await client.connect()
+
+    errors = [record for record in caplog.records if record.levelname == "ERROR"]
+    assert len(errors) == 1
+    assert errors[0].exc_info is not None

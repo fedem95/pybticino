@@ -355,3 +355,23 @@ async def test_full_auth_topology_status_flow():
         assert len(events["body"]["home"]["events"]) == 1
 
     await handler.close_session()
+
+
+async def test_api_error_keeps_status_and_stays_quiet(authenticated_account, caplog):
+    """A gateway error keeps its status code and is not logged as an ERROR.
+
+    The nginx 502 page used to come back as "API Error 0: Unexpected error:
+    API Error 502: <html>..." with three ERROR records for one failed poll.
+    """
+    account = authenticated_account
+    nginx_page = "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n</html>\r\n"
+
+    with aioresponses() as m:
+        m.post(HOMESDATA_URL, status=502, body=nginx_page, reason="Bad Gateway")
+
+        with pytest.raises(ApiError) as err:
+            await account.async_update_topology()
+
+    assert err.value.status_code == 502
+    assert err.value.error_message == "Bad Gateway"
+    assert not [record for record in caplog.records if record.levelname == "ERROR"]
