@@ -267,6 +267,58 @@ class TestMessageHandling:
         assert signaling_client._session_id == "new-sess"
         assert signaling_client._tag_id == "new-tag"
 
+    async def _start_offer(self, signaling_client, sent):
+        """Start send_offer and return (task, correlation_id) once it is waiting."""
+
+        async def mock_send(msg):
+            sent.append(msg)
+
+        signaling_client._send = mock_send
+        task = asyncio.create_task(signaling_client.send_offer(device_id=MOCK_BRIDGE_ID, sdp="v=0"))
+        await asyncio.sleep(0.01)
+        return task, sent[-1]["correlation_id"]
+
+    async def test_subscribe_ack_does_not_complete_the_offer(self, signaling_client):
+        """A resubscribe ack (correlation_id 0) arriving first must not end the offer wait."""
+        task, corr = await self._start_offer(signaling_client, [])
+
+        await signaling_client._handle_message({"type": "ack", "status": "ok", "correlation_id": 0})
+        await asyncio.sleep(0)
+        assert not task.done()
+
+        await signaling_client._handle_message(
+            {"type": "ack", "status": "ok", "correlation_id": corr, "session_id": "sess-1", "tag_id": "t"}
+        )
+        assert await task == "sess-1"
+
+    async def test_offer_error_ack_raises(self, signaling_client):
+        """An error ack for the offer is raised instead of returning an empty session."""
+        task, corr = await self._start_offer(signaling_client, [])
+
+        await signaling_client._handle_message(
+            {
+                "type": "ack",
+                "status": "error",
+                "correlation_id": corr,
+                "error": {"code": 11, "message": "Internal error"},
+            }
+        )
+
+        with pytest.raises(PyBticinoException, match="Internal error"):
+            await task
+
+    async def test_uncorrelated_error_ack_fails_the_waiting_offer(self, signaling_client):
+        """The server sends some errors without a correlation_id; they fail the waiting offer."""
+        task, _ = await self._start_offer(signaling_client, [])
+
+        await signaling_client._handle_message(
+            {"type": "ack", "status": "error", "error": {"code": 11, "message": "Internal error"}}
+        )
+
+        with pytest.raises(PyBticinoException, match="Internal error"):
+            await task
+        assert signaling_client._pending_acks == {}
+
     async def test_subscribe_message_format(self, signaling_client):
         """Subscribe should use app_security and version 1.0."""
         sent_raw = []
