@@ -268,13 +268,20 @@ class SignalingClient:
         if tag_id is not None:
             self._tag_id = tag_id
 
-        # Resolve any pending ack future
-        # The ack doesn't contain correlation_id, so resolve the most recent pending
-        for corr_id, fut in list(self._pending_acks.items()):
-            if not fut.done():
-                fut.set_result(message)
-                del self._pending_acks[corr_id]
-                break
+        # The offer ack echoes the offer's correlation_id. Acks for a subscribe
+        # (correlation_id 0) must not complete a pending offer: the offer would
+        # then return without a session and miss an error ack arriving later.
+        corr_id = message.get("correlation_id")
+        fut = self._pending_acks.pop(str(corr_id), None) if corr_id not in (None, "", 0) else None
+        if fut is None and "correlation_id" not in message and message.get("status") == "error":
+            # The server reports some failures ("Internal error") without a
+            # correlation_id; they answer the oldest request still waiting.
+            for pending_id in list(self._pending_acks):
+                fut = self._pending_acks.pop(pending_id)
+                if not fut.done():
+                    break
+        if fut is not None and not fut.done():
+            fut.set_result(message)
 
     async def _send(self, message: dict[str, Any]) -> None:
         """Send a JSON message on the signaling WS."""
@@ -360,6 +367,10 @@ class SignalingClient:
 
         try:
             ack = await asyncio.wait_for(ack_future, timeout=30)
+            if ack.get("status") == "error":
+                error = ack.get("error") or {}
+                err_msg = f"Offer rejected: {error.get('message', 'unknown error')} (code {error.get('code')})"
+                raise PyBticinoException(err_msg)
             session_id = ack.get("session_id", "")
             _LOGGER.info("Offer sent, session_id=%s", session_id)
             return session_id
