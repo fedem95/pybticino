@@ -89,7 +89,7 @@ class TestSignalingMessages:
         signaling_client._device_id = MOCK_BRIDGE_ID
         signaling_client._correlation_id = "corr-456"
 
-        await signaling_client.send_answer(sdp="v=0\r\nanswer sdp")
+        await signaling_client.send_answer(sdp="v=0\r\nanswer sdp", timeout=0.01)
 
         assert len(sent_messages) == 1
         msg = sent_messages[0]
@@ -99,7 +99,58 @@ class TestSignalingMessages:
         assert msg["session_id"] == "sess-123"
         assert msg["tag_id"] == "tag-abc"
         assert msg["device_id"] == MOCK_BRIDGE_ID
-        assert msg["correlation_id"] == "corr-456"
+        # A fresh id, not the push's: the server only takes ^\d+$.
+        assert msg["correlation_id"] != "corr-456"
+        assert msg["correlation_id"].isdigit()
+
+    async def test_send_answer_waits_for_its_ack(self, signaling_client):
+        """send_answer returns only once the server acked that answer."""
+        sent_messages = []
+
+        async def mock_send(msg):
+            sent_messages.append(msg)
+
+        signaling_client._send = mock_send
+        signaling_client._session_id = "sess-123"
+        signaling_client._tag_id = "tag-abc"
+        signaling_client._device_id = MOCK_BRIDGE_ID
+
+        task = asyncio.create_task(signaling_client.send_answer(sdp="answer"))
+        await asyncio.sleep(0.01)
+        assert not task.done()
+
+        corr_id = sent_messages[0]["correlation_id"]
+        await signaling_client._handle_message({"type": "ack", "status": "ok", "correlation_id": int(corr_id)})
+        ack = await asyncio.wait_for(task, timeout=1)
+        assert ack["status"] == "ok"
+
+    async def test_send_answer_error_ack_raises(self, signaling_client):
+        """An answer the server refuses raises with the server's message."""
+        sent_messages = []
+
+        async def mock_send(msg):
+            sent_messages.append(msg)
+
+        signaling_client._send = mock_send
+        signaling_client._session_id = "sess-123"
+        signaling_client._tag_id = "tag-abc"
+        signaling_client._device_id = MOCK_BRIDGE_ID
+
+        task = asyncio.create_task(signaling_client.send_answer(sdp="answer"))
+        await asyncio.sleep(0.01)
+        corr_id = sent_messages[0]["correlation_id"]
+        await signaling_client._handle_message(
+            {"type": "ack", "status": "error", "correlation_id": corr_id, "error": {"code": 11, "message": "bad"}}
+        )
+        with pytest.raises(PyBticinoException, match="Answer rejected: bad"):
+            await asyncio.wait_for(task, timeout=1)
+
+    async def test_correlation_ids_are_positive_and_distinct(self, signaling_client):
+        """Every RTC message gets its own non-negative id, even with the top bit set."""
+        signaling_client._correlation_high = 0xFFFFFFFF
+        ids = [signaling_client._next_correlation_id() for _ in range(3)]
+        assert len(set(ids)) == 3
+        assert all(value.isdigit() and int(value) < 1 << 63 for value in ids)
 
     async def test_send_candidate_message_format(self, signaling_client):
         """send_candidate should format ICE candidate correctly."""
@@ -192,7 +243,7 @@ class TestSessionFromPush:
             device_id=MOCK_BRIDGE_ID,
         )
 
-        await signaling_client.send_answer(sdp="answer-sdp")
+        await signaling_client.send_answer(sdp="answer-sdp", timeout=0.01)
 
         assert len(sent_messages) == 1
         assert sent_messages[0]["session_id"] == "push-sess"

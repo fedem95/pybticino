@@ -21,6 +21,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import suppress
 import json
 import logging
+import secrets
 import ssl
 from typing import Any
 
@@ -83,6 +84,9 @@ class SignalingClient:
         self._tag_id: str | None = None
         self._correlation_id: str | None = None
         self._device_id: str | None = None
+        # Each RTC message after the offer gets its own correlation ID.
+        self._correlation_high = secrets.randbits(32)
+        self._correlation_counter = 0
 
     @property
     def is_connected(self) -> bool:
@@ -290,6 +294,17 @@ class SignalingClient:
         _LOGGER.debug("Signaling send: %s", message)
         await self._websocket.send(json.dumps(message))
 
+    def _next_correlation_id(self) -> str:
+        """Return a new correlation ID for one RTC message.
+
+        The signaling server checks correlation_id against ``^\\d+$`` and
+        rejects anything else with error code 11, so the value stays a
+        non-negative long, like the ones the official app sends.
+        """
+        self._correlation_counter += 1
+        value = (self._correlation_high << 32) | (self._correlation_counter & 0xFFFFFFFF)
+        return str(value & ((1 << 63) - 1))
+
     async def resubscribe(self) -> None:
         """Re-subscribe on the existing connection with a fresh token.
 
@@ -379,19 +394,29 @@ class SignalingClient:
             err_msg = "Timeout waiting for offer ack"
             raise PyBticinoException(err_msg) from e
 
-    async def send_answer(self, sdp: str) -> None:
-        """Send an SDP answer (for incoming calls).
+    async def send_answer(self, sdp: str, timeout: float = 10) -> dict[str, Any] | None:
+        """Send an SDP answer (for incoming calls) and wait for its ack.
 
-        Uses the session state (session_id, tag_id, device_id, correlation_id)
-        set by the most recent offer or ack.
+        Uses the session state (session_id, tag_id, device_id) set from the
+        push offer. The server refuses ICE candidates that reach it before it
+        has processed the answer ("Received ICE candidate before answer",
+        error code 13), so callers must await this before sending theirs.
 
         Args:
             sdp: The SDP answer string.
+            timeout: Seconds to wait for the server ack.
+
+        Returns:
+            The server ack, or None if it did not arrive within the timeout.
+
+        Raises:
+            PyBticinoException: If the server rejects the answer.
 
         """
         if not self._session_id:
             raise PyBticinoException("No active session to send answer to")
 
+        correlation_id = self._next_correlation_id()
         message = {
             "action": "rtc",
             "data": {
@@ -404,10 +429,27 @@ class SignalingClient:
             "session_id": self._session_id,
             "tag_id": self._tag_id,
             "device_id": self._device_id,
-            "correlation_id": self._correlation_id,
+            "correlation_id": correlation_id,
         }
+
+        loop = asyncio.get_running_loop()
+        ack_future: asyncio.Future[dict] = loop.create_future()
+        self._pending_acks[correlation_id] = ack_future
+
         await self._send(message)
         _LOGGER.info("Answer sent for session %s", self._session_id)
+
+        try:
+            ack = await asyncio.wait_for(ack_future, timeout=timeout)
+        except TimeoutError:
+            self._pending_acks.pop(correlation_id, None)
+            _LOGGER.warning("No ack for the answer within %.0f s; continuing", timeout)
+            return None
+        if ack.get("status") == "error":
+            error = ack.get("error") or {}
+            err_msg = f"Answer rejected: {error.get('message', 'unknown error')} (code {error.get('code')})"
+            raise PyBticinoException(err_msg)
+        return ack
 
     async def send_candidate(self, candidate: str, sdp_m_line_index: int) -> None:
         """Send an ICE candidate.
@@ -420,6 +462,7 @@ class SignalingClient:
         if not self._session_id:
             raise PyBticinoException("No active session to send candidate to")
 
+        correlation_id = self._next_correlation_id()
         message = {
             "action": "rtc",
             "data": {
@@ -432,7 +475,7 @@ class SignalingClient:
             "session_id": self._session_id,
             "tag_id": self._tag_id,
             "device_id": self._device_id,
-            "correlation_id": self._correlation_id,
+            "correlation_id": correlation_id,
         }
         await self._send(message)
 
@@ -442,13 +485,14 @@ class SignalingClient:
             _LOGGER.debug("No active session to terminate")
             return
 
+        correlation_id = self._next_correlation_id()
         message = {
             "action": "rtc",
             "data": {"type": "terminate"},
             "session_id": self._session_id,
             "tag_id": self._tag_id,
             "device_id": self._device_id,
-            "correlation_id": self._correlation_id,
+            "correlation_id": correlation_id,
         }
         await self._send(message)
         _LOGGER.info("Terminate sent for session %s", self._session_id)
@@ -459,19 +503,21 @@ class SignalingClient:
         self,
         session_id: str,
         tag_id: str,
-        correlation_id: str,
+        correlation_id: str | None,
         device_id: str,
     ) -> None:
-        """Set session state from a push WS offer (incoming call).
+        """Set session state from a push offer (incoming call).
 
-        When a call comes in via the push WS, the session details are in
-        the push event. This method sets them so send_answer/send_candidate
-        can be used without first sending an offer.
+        When a call comes in via a push (WebSocket or FCM), the session
+        details are in the push event. This method sets them so
+        send_answer/send_candidate can be used without first sending an offer.
 
         Args:
             session_id: From extra_params.session_id in the push event.
             tag_id: From extra_params.tag_id in the push event.
             correlation_id: From extra_params.correlation_id in the push event.
+                Kept for reference only: every message sent afterwards gets
+                its own correlation ID.
             device_id: The bridge MAC (extra_params.device_id).
 
         """
