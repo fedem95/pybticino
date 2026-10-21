@@ -746,3 +746,40 @@ class AsyncAccount:
         except aiohttp.ClientError as e:
             LOG.exception("TURN request error")
             raise ApiError(0, f"TURN request error: {e}") from e
+
+    async def async_add_push_context(self, context: dict[str, Any]) -> dict[str, Any]:
+        """Register a push token so the account's pushes are delivered to it.
+
+        Args:
+            context: The /api/addpushcontext body: ``credentials`` (a JSON
+                string such as ``{"device_token": ...}``), ``type``,
+                ``app_type``, ``app_version`` and the device fields.
+
+        Returns:
+            The API response.
+
+        Raises:
+            AuthError: If authentication fails.
+            ApiError: If the API request fails.
+
+        """
+        return await self._async_post_api_request("/api/addpushcontext", json_data=context)
+
+    async def async_drop_push_context(self, credentials: str, push_type: str) -> dict[str, Any]:
+        """Remove a push token registered with async_add_push_context.
+
+        Args:
+            credentials: The same ``credentials`` string used to register it.
+            push_type: The same ``type`` used to register it (e.g. "Android").
+
+        Returns:
+            The API response.
+
+        Raises:
+            AuthError: If authentication fails.
+            ApiError: If the API request fails.
+
+        """
+        return await self._async_post_api_request(
+            "/api/droppushcontext", json_data={"credentials": credentials, "type": push_type}
+        )

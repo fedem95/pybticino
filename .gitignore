@@ -148,3 +148,8 @@ uv.lock
 .ruff_cache
 .env
 .credentials
+
+# Netatmo app's Firebase identity and APKs (pybticino.fcm): never commit them
+bticino_intercom_fcm.json
+*.apk
+captures/
