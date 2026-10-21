@@ -27,6 +27,12 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
+# pybticino.fcm: call pushes through FCM (Classe 300 EOS offers). The aiohttp
+# floor is for ClientSession middlewares.
+fcm = [
+    "firebase-messaging>=0.4.5",
+    "aiohttp>=3.12",
+]
 test = [
     "pytest",
     "pytest-asyncio",
