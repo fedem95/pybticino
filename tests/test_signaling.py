@@ -149,6 +149,40 @@ class TestSignalingMessages:
         assert signaling_client._session_id is None
         assert signaling_client._tag_id is None
 
+    async def test_send_player_message_format(self, signaling_client):
+        """send_player sends the app's player message on the named session and keeps it."""
+        sent_messages = []
+
+        async def mock_send(msg):
+            sent_messages.append(msg)
+
+        signaling_client._send = mock_send
+        signaling_client.set_session_from_push(
+            session_id="sess-123", tag_id="tag-abc", correlation_id="", device_id=MOCK_BRIDGE_ID
+        )
+        signaling_client.set_session_from_push(
+            session_id="other", tag_id="tag-x", correlation_id="1", device_id=MOCK_BRIDGE_ID
+        )
+
+        await signaling_client.send_player("unmute", session_id="sess-123")
+
+        msg = sent_messages[0]
+        assert msg["action"] == "rtc"
+        assert msg["data"] == {"type": "player", "value": "unmute"}
+        assert msg["session_id"] == "sess-123"
+        assert msg["tag_id"] == "tag-abc"
+        assert msg["device_id"] == MOCK_BRIDGE_ID
+        # A fresh numeric correlation id even when the push carried none.
+        assert msg["correlation_id"].isdigit()
+        # The call goes on: the session is still there to terminate.
+        await signaling_client.send_terminate(session_id="sess-123")
+        assert sent_messages[1]["session_id"] == "sess-123"
+
+    async def test_send_player_without_session_raises(self, signaling_client):
+        """send_player without an active session should raise."""
+        with pytest.raises(PyBticinoException, match="No active session"):
+            await signaling_client.send_player("unmute")
+
     async def test_send_answer_without_session_raises(self, signaling_client):
         """send_answer without an active session should raise."""
         with pytest.raises(PyBticinoException, match="No active session"):

@@ -491,6 +491,41 @@ class SignalingClient:
         }
         await self._send(message)
 
+    async def send_player(self, value: str, session_id: str | None = None) -> None:
+        """Send a "player" message on a call session.
+
+        The official app's generic rtc message ``{"type": "player", "value": ...}``.
+        Answering a Classe 300 EOS call takes two steps: the SDP answer only
+        opens the preview (the indoor monitor keeps ringing and the call ends as
+        missed), and ``send_player("unmute")`` is the green handset that takes
+        the call: the device stops ringing and reports ``accepted_call``.
+        Traced from com.netatmo.camera 4.1.1.3.
+
+        Args:
+            value: The player command, e.g. ``"unmute"``.
+            session_id: The call's session. Defaults to the most recent one.
+
+        Raises:
+            PyBticinoException: If there is no such session.
+
+        """
+        resolved = self._resolve_session(session_id)
+        if resolved is None:
+            raise PyBticinoException("No active session to send a player message to")
+        sid, session = resolved
+
+        message = {
+            "action": "rtc",
+            "data": {"type": "player", "value": value},
+            "session_id": sid,
+            "tag_id": session.tag_id,
+            "device_id": session.device_id,
+            # A fresh one, as the app sends: the push may carry none.
+            "correlation_id": str(next(self._correlation_ids)),
+        }
+        await self._send(message)
+        _LOGGER.info("Player %s sent for session %s", value, sid)
+
     async def send_terminate(self, session_id: str | None = None) -> None:
         """Terminate a call session.
 
