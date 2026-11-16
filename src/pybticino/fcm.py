@@ -58,6 +58,14 @@ _FIREBASE_APP_NAME_HASH = (
 # PHONE_REGISTRATION_ERROR is common right after a new checkin; a retry clears it.
 _REGISTER_ATTEMPTS = 5
 
+# A dropped FCM connection is reopened by a new client after these waits,
+# doubling from the first to the last; a connection that stayed up for
+# RECONNECT_STABLE_SECONDS starts the waits over.
+RECONNECT_DELAY_INITIAL = 5.0
+RECONNECT_DELAY_MAX = 300.0
+RECONNECT_STABLE_SECONDS = 300.0
+_sleep = asyncio.sleep  # the reconnect wait; tests replace it
+
 OnPushCallback = Callable[[dict[str, Any]], None]
 OnCredentialsCallback = Callable[[dict[str, Any]], None]
 
@@ -284,6 +292,28 @@ class _AndroidFcmPushClient(FcmPushClient):
         super().__init__(*args, **kwargs)
         self._app_config = app_config
 
+    async def _reset(self) -> None:
+        """End the connection instead of reconnecting in place.
+
+        firebase-messaging (0.4.5) reconnects in place: while ``_reset`` holds
+        its lock and connects again, ``_listen`` keeps reading the old stream.
+        Once that stream has failed, ``readexactly`` raises its stored
+        exception at once, without yielding, and the nested ``_reset`` returns
+        at once because the lock is taken: the listen loop spins without ever
+        letting the event loop run, so the reconnect it waits for never
+        happens. In Home Assistant that is tens of thousands of log lines a
+        second until the process dies.
+
+        Here any error that would reset the connection closes it and stops
+        this client; FcmCallListener opens a new one after a growing wait.
+        """
+        if not self.do_listen:
+            return
+        _LOGGER.debug("FCM connection failed; closing it")
+        # Stops the listen loop (do_listen) and cancels the client's other task.
+        self._terminate()
+        await self._do_writer_close()
+
     async def checkin_or_register(self) -> str:
         register = FcmRegister(self.fcm_config, http_client_session=self._http_client_session)
         if self.credentials and self.credentials.get("android"):
@@ -338,25 +368,31 @@ class FcmCallListener:
         self._session: aiohttp.ClientSession | None = None
         self._client: _AndroidFcmPushClient | None = None
         self._context: dict[str, Any] | None = None
+        self._supervisor: asyncio.Task[None] | None = None
 
     @property
     def is_registered(self) -> bool:
         """Return True once the token is registered with the account."""
         return self._context is not None
 
-    async def async_start(self) -> None:
-        """Register with FCM, start listening and add the token to the account."""
-        self._session = _firebase_session(self._app_config)
-        self._client = _AndroidFcmPushClient(
+    def _new_client(self) -> _AndroidFcmPushClient:
+        return _AndroidFcmPushClient(
             self._handle_push,
             self._app_config.register_config(),
             self._credentials,
             self._handle_credentials,
             http_client_session=self._session,
-            # A long-running listener must keep reconnecting, never give up.
-            config=FcmPushClientConfig(abort_on_sequential_error_count=None),
+            # One connection attempt per client and no reconnect in place: a
+            # failed connection ends the client, and _async_supervise opens a
+            # new one after a growing wait (see _AndroidFcmPushClient._reset).
+            config=FcmPushClientConfig(abort_on_sequential_error_count=None, connection_retry_count=1),
             app_config=self._app_config,
         )
+
+    async def async_start(self) -> None:
+        """Register with FCM, start listening and add the token to the account."""
+        self._session = _firebase_session(self._app_config)
+        self._client = self._new_client()
         try:
             token = await self._client.checkin_or_register()
             await self._client.start()
@@ -366,10 +402,60 @@ class FcmCallListener:
         except BaseException:
             await self.async_stop(drop_context=False)
             raise
+        self._supervisor = asyncio.create_task(self._async_supervise(), name="pybticino FCM listener")
         _LOGGER.info("FCM push context registered")
+
+    async def _async_supervise(self) -> None:
+        """Open a new connection whenever the current one ends, waiting longer each time.
+
+        The token stays registered with the account across reconnects: only
+        the connection to FCM is new.
+        """
+        loop = asyncio.get_running_loop()
+        delay = RECONNECT_DELAY_INITIAL
+        while True:
+            started = loop.time()
+            client = self._client
+            if client is not None and client.tasks:
+                await asyncio.wait(client.tasks, return_when=asyncio.FIRST_COMPLETED)
+            await self._async_close_client()
+            if loop.time() - started >= RECONNECT_STABLE_SECONDS:
+                delay = RECONNECT_DELAY_INITIAL
+            _LOGGER.warning("FCM connection ended; reconnecting in %.0f s", delay)
+            await _sleep(delay)
+            delay = min(delay * 2, RECONNECT_DELAY_MAX)
+            try:
+                self._client = self._new_client()
+                await self._client.start()
+            except Exception as err:
+                _LOGGER.warning("Could not restart the FCM client: %s", err)
+                await self._async_close_client()
+
+    async def _async_close_client(self) -> None:
+        """Stop the current client's tasks and close its connection."""
+        client, self._client = self._client, None
+        if client is None:
+            return
+        # stop() needs the locks start() creates.
+        if client.stopping_lock is not None:
+            with contextlib.suppress(Exception):
+                await client.stop()
+        # A client that ended on its own has already set its state to stopping,
+        # and stop() then does nothing: cancel what is left of it here.
+        for task in list(getattr(client, "tasks", None) or []):
+            if not task.done():
+                task.cancel()
+        with contextlib.suppress(Exception):
+            # firebase-messaging has no public way to close the connection
+            await client._do_writer_close()
 
     async def async_stop(self, drop_context: bool = True) -> None:
         """Stop listening; with drop_context, also remove the token from the account."""
+        supervisor, self._supervisor = self._supervisor, None
+        if supervisor is not None:
+            supervisor.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await supervisor
         if drop_context and self._context:
             try:
                 await self._account.async_drop_push_context(self._context["credentials"], PUSH_TYPE)
@@ -377,11 +463,7 @@ class FcmCallListener:
             except Exception as err:
                 _LOGGER.warning("Could not remove the FCM push context: %s", err)
         self._context = None
-        client, self._client = self._client, None
-        # stop() needs the locks start() creates.
-        if client and client.stopping_lock is not None:
-            with contextlib.suppress(Exception):
-                await client.stop()
+        await self._async_close_client()
         session, self._session = self._session, None
         if session:
             await session.close()
